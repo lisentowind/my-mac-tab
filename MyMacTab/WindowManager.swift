@@ -139,50 +139,87 @@ final class WindowManager: NSObject, ObservableObject {
     }
 
     func handleDockSearchCommand(_ selector: Selector) -> Bool {
-        let code: Int64
-        switch NSStringFromSelector(selector) {
-        case "moveUp:": code = 126
-        case "moveDown:": code = 125
-        case "insertNewline:": code = 36
-        case "cancelOperation:":
-            if dockSearchText.isEmpty { dismissDockPreview() } else { clearDockSearch() }
-            return true
-        default: return false
-        }
-        return handlePreviewKey(code, text: "", flags: [], fromSearch: true)
+        guard let event = NSApp.currentEvent, event.type == .keyDown else { return false }
+        return handlePreviewKey(Int64(event.keyCode), text: "",
+                                flags: CGEventFlags(rawValue: UInt64(event.modifierFlags.rawValue)), fromSearch: true)
     }
 
     private func handlePreviewKey(_ code: Int64, text: String, flags: CGEventFlags, fromSearch: Bool = false) -> Bool {
         guard let panel = dockPreviewPanel, panel.isVisible, dockPreviewMenuFrames.isEmpty,
-              fromSearch || (!panel.isKeyWindow && (panel.frame.contains(NSEvent.mouseLocation) || thumbnail.contains(NSEvent.mouseLocation))),
-              flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty else { return false }
-        switch code {
-        case 125, 126, 48:
+              ShortcutConfiguration.shared.recordingAction == nil,
+              fromSearch || (!panel.isKeyWindow && (panel.frame.contains(NSEvent.mouseLocation) || thumbnail.contains(NSEvent.mouseLocation))) else { return false }
+        let modifiers = NSEvent.ModifierFlags(rawValue: UInt(flags.rawValue))
+        let action = ShortcutConfiguration.shared.action(for: UInt16(clamping: code), modifiers: modifiers, group: "Dock 列表")
+        if let action { return performPreviewShortcut(action) }
+        guard !fromSearch, flags.intersection([.maskCommand, .maskControl, .maskAlternate]).isEmpty,
+              !text.isEmpty, text.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .privateUse
+              }), dockSearchText.count < 120 else { return false }
+        setDockSearch(dockSearchText + text)
+        return true
+    }
+
+    private func performPreviewShortcut(_ action: ShortcutAction) -> Bool {
+        switch action {
+        case .previewPreviousWindow, .previewNextWindow, .previewPreviousTab, .previewNextTab:
             dockKeyboardPointer = NSEvent.mouseLocation
             guard !dockPreviewWindows.isEmpty else { return true }
-            let offset = code == 126 || (code == 48 && flags.contains(.maskShift)) ? -1 : 1
+            let offset = action == .previewPreviousWindow || action == .previewPreviousTab ? -1 : 1
             let current = dockPreviewWindows.firstIndex(where: { $0.id == dockSelectedWindowID }) ?? (offset > 0 ? -1 : 0)
             let window = dockPreviewWindows[(current + offset + dockPreviewWindows.count) % dockPreviewWindows.count]
             selectDockWindow(window.id)
             thumbnail.hover(window, preferences: preferences)
             return true
-        case 36, 76:
+        case .previewOpenWindow, .previewOpenKeypad:
             if let id = dockSelectedWindowID, dockPreviewWindows.contains(where: { $0.id == id }) { openDockWindow(id) }
             return true
-        case 53:
+        case .previewDismiss:
             if dockSearchText.isEmpty { dismissDockPreview() } else { clearDockSearch() }
             return true
-        case 51, 117:
+        case .previewDeleteCharacter, .previewDeleteForward:
+            if isDockSearchEditing { return false }
             if !dockSearchText.isEmpty { setDockSearch(String(dockSearchText.dropLast())) }
             return true
-        default:
-            guard !text.isEmpty, text.unicodeScalars.allSatisfy({
-                !CharacterSet.controlCharacters.contains($0) && $0.properties.generalCategory != .privateUse
-            }),
-                  dockSearchText.count < 120 else { return false }
-            setDockSearch(dockSearchText + text)
+        case .previewMinimizeWindow:
+            if let id = dockSelectedWindowID { minimizeOrRestoreDockWindow(id) }
             return true
+        case .previewCloseWindow:
+            if let id = dockSelectedWindowID { closeDockWindow(id) }
+            return true
+        case .previewSearch:
+            beginDockSearch()
+            return true
+        default:
+            return false
         }
+    }
+
+    func handleRingKey(_ event: NSEvent) -> Bool {
+        handleRingShortcut(keyCode: event.keyCode, modifiers: event.modifierFlags)
+    }
+
+    // 面板未成为 key window 时（accessory 应用切换前台存在竞态），事件 tap 仍按同一套配置处理按键。
+    func handleRingShortcut(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> Bool {
+        guard ringRequested, ringPanel?.isVisible == true, ringNeedsInitialSelection == false,
+              ShortcutConfiguration.shared.recordingAction == nil,
+              let action = ShortcutConfiguration.shared.action(for: keyCode, modifiers: modifiers,
+                                                               group: "窗口环") else { return false }
+        switch action {
+        case .previousApplication: moveApplication(-1)
+        case .nextApplication: moveApplication(1)
+        case .previousWindow: moveWindow(-1)
+        case .nextWindow: moveWindow(1)
+        case .activateWindow: activateSelectedWindow()
+        case .dismissOverlay: dismissRing()
+        case .tileLeft: splitSelectedWindow(to: .left)
+        case .tileRight: splitSelectedWindow(to: .right)
+        case .minimizeWindow:
+            if let id = selectedWindow?.id { minimizeOrRestoreDockWindow(id); dismissRing() }
+        case .closeWindow:
+            if let id = selectedWindow?.id { closeDockWindow(id); dismissRing() }
+        default: return false
+        }
+        return true
     }
 
     private var ringPanel: NSPanel?
@@ -202,6 +239,8 @@ final class WindowManager: NSObject, ObservableObject {
     private var dockPreviewLabelFrames: [CGRect] = []
     private var ringFrontmostPID: pid_t?
     private var ringRequested = false
+    private var ringNeedsInitialSelection = false
+    private var lastExternalApplicationPID: pid_t?
     private var windowCache: [pid_t: [ManagedWindow]] = [:]
     private var windowCacheTimes: [pid_t: TimeInterval] = [:]
     private var iconCache: [pid_t: NSImage] = [:]
@@ -216,6 +255,13 @@ final class WindowManager: NSObject, ObservableObject {
     private let windowCacheLifetime: TimeInterval = 1
     private var outsideClickMonitor: Any?
     private var ringClickMonitor: Any?
+    private var ringScrollMonitor: Any?
+    private var ringScrollGestureActive = false
+    private var ringScrollGestureStepped = false
+    private var ringScrollGestureLastEventTime: TimeInterval = 0
+    private var ringClickConsumed = false
+    private var ringFocusAttempts = 0
+    private let ringKeyboard = PreviewKeyboardMonitor()
 
     var selectedApplication: WindowApplication? {
         selectedApplicationID.flatMap { applicationsByID[$0] } ?? applications.first
@@ -268,18 +314,19 @@ final class WindowManager: NSObject, ObservableObject {
             openAccessibilitySettings()
             return
         }
-        if !ringRequested {
-            ringFrontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        }
+        guard !ringRequested else { return }
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        ringFrontmostPID = frontmost?.processIdentifier == ProcessInfo.processInfo.processIdentifier
+            ? lastExternalApplicationPID : frontmost?.processIdentifier
+        ringNeedsInitialSelection = true
         ringRequested = true
         dismissDockPreview()
-        rebuildApplications()
-        if !applications.isEmpty { presentRing() }
+        // 在激活自身前读取当前应用，避免沿用上次 Dock 或圆环的选择。
         refreshWindows()
     }
 
     private func presentRing() {
-        guard ringRequested, ringPanel?.isVisible != true else { return }
+        guard ringRequested, !ringNeedsInitialSelection, ringPanel?.isVisible != true else { return }
         let screen = screenUnderPointer()
         let panel = ringPanel ?? makeRingPanel()
         ringPanel = panel
@@ -288,32 +335,86 @@ final class WindowManager: NSObject, ObservableObject {
                                      available.height / WindowRingGeometry.panelSize.height))
         let size = CGSize(width: WindowRingGeometry.panelSize.width * ringDisplayScale,
                           height: WindowRingGeometry.panelSize.height * ringDisplayScale)
-        let hostingView = NSHostingView(rootView: WindowRingView(manager: self, displayScale: ringDisplayScale))
-        hostingView.sizingOptions = []
-        panel.contentView = hostingView
+        // 先定面板尺寸再装内容，避免 contentView 换装时按旧尺寸缩放一层。
         panel.setFrame(CGRect(x: available.midX - size.width / 2, y: available.midY - size.height / 2,
                               width: size.width, height: size.height), display: false)
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
+        panel.contentView = makeRingContent(size: size)
         panel.contentView?.layoutSubtreeIfNeeded()
+        activateRingPanel(panel)
         // 初始布局完成后直接显示；快捷键呼出不添加缩放或位移动画。
         DispatchQueue.main.async { [weak self] in
             guard let self, self.ringRequested, self.ringPanel?.isVisible == true else { return }
             self.isRingPresented = true
         }
         installRingClickMonitors()
+        installRingScrollMonitor()
+        startRingKeyboard()
+    }
+
+    // 玻璃背景不参与命中测试，圆环空白处的点击与滚轮会被系统转给下层窗口；
+    // 外层容器补上兜底命中，SwiftUI 内容仍然优先响应。
+    private func makeRingContent(size: CGSize) -> NSView {
+        let hostingView = NSHostingView(rootView: WindowRingView(manager: self, displayScale: ringDisplayScale))
+        hostingView.sizingOptions = []
+        hostingView.frame = CGRect(origin: .zero, size: size)
+        hostingView.autoresizingMask = [.width, .height]
+        let container = RingContentView(frame: CGRect(origin: .zero, size: size))
+        container.autoresizesSubviews = true
+        container.addSubview(hostingView)
+        return container
+    }
+
+    // accessory 应用的激活是异步的，紧接着调用 makeKey 时系统可能还没切换前台应用。
+    private func activateRingPanel(_ panel: NSPanel) {
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+        ringFocusAttempts = 0
+        confirmRingKeyWindow()
+    }
+
+    private func confirmRingKeyWindow() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
+            guard let self, self.ringRequested, let panel = self.ringPanel, panel.isVisible else { return }
+            if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+            if !panel.isKeyWindow { panel.makeKeyAndOrderFront(nil) }
+            self.ringFocusAttempts += 1
+            if !panel.isKeyWindow, self.ringFocusAttempts < 6 { self.confirmRingKeyWindow() }
+        }
+    }
+
+    // 面板拿到键盘焦点前也能用快捷键；tap 可用时按键不会漏到下层应用。
+    private func startRingKeyboard() {
+        ringKeyboard.handleKey = { [weak self] code, _, flags in
+            guard let self else { return false }
+            return self.handleRingShortcut(keyCode: UInt16(clamping: code),
+                                           modifiers: NSEvent.ModifierFlags(rawValue: UInt(flags.rawValue)))
+        }
+        ringKeyboard.start()
     }
 
     func dismissRing() {
         ringRequested = false
+        ringNeedsInitialSelection = false
         cancelWindowRefresh()
         if isRingPresented { isRingPresented = false }
         ringPanel?.orderOut(nil)
         ringPanel?.contentView = nil
         if let outsideClickMonitor { NSEvent.removeMonitor(outsideClickMonitor) }
         if let ringClickMonitor { NSEvent.removeMonitor(ringClickMonitor) }
+        if let ringScrollMonitor { NSEvent.removeMonitor(ringScrollMonitor) }
         outsideClickMonitor = nil
         ringClickMonitor = nil
+        ringScrollMonitor = nil
+        resetRingScrollGesture()
+        ringClickConsumed = false
+        ringFocusAttempts = 0
+        // 快捷键可能正是在 tap 回调里触发的，等本次事件处理完再失效 tap，避免回调中停掉自身。
+        let keyboard = ringKeyboard
+        DispatchQueue.main.async { [weak self] in
+            guard self?.ringRequested != true else { return }
+            keyboard.stop()
+        }
     }
 
     private func installRingClickMonitors() {
@@ -324,33 +425,137 @@ final class WindowManager: NSObject, ObservableObject {
                 self.dismissRing()
             }
         }
-        ringClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
-            guard let self, let panel = self.ringPanel, panel.isVisible,
-                  event.window === panel, !self.isRingContentPoint(NSEvent.mouseLocation) else { return event }
-            self.dismissRing()
-            return nil
+        ringClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .rightMouseDown]) { [weak self] event in
+            guard let self, let panel = self.ringPanel, panel.isVisible, event.window === panel else { return event }
+            let point = NSEvent.mouseLocation
+            switch event.type {
+            case .leftMouseDown:
+                // 环带整体作为图标命中区：点在图标之间的空隙也选中角度最近的应用。
+                if self.selectRingApplication(atScreen: point) {
+                    // 事件被吞掉后系统不会再按点击自动把面板设为 key window。
+                    if !panel.isKeyWindow { panel.makeKey() }
+                    self.ringClickConsumed = true
+                    return nil
+                }
+                // 上一次按下被吞掉后抬起可能落在面板外，这里清掉残留标记，避免误吞列表点击的抬起。
+                self.ringClickConsumed = false
+                guard !self.isRingContentPoint(point) else { return event }
+                self.dismissRing()
+                return nil
+            case .leftMouseUp:
+                guard self.ringClickConsumed else { return event }
+                self.ringClickConsumed = false
+                return nil
+            default:
+                guard !self.isRingContentPoint(point) else { return event }
+                self.dismissRing()
+                return nil
+            }
         }
     }
 
-    private func isRingContentPoint(_ point: CGPoint) -> Bool {
-        guard let panel = ringPanel else { return false }
+    private func installRingScrollMonitor() {
+        guard ringScrollMonitor == nil else { return }
+        ringScrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self, let panel = self.ringPanel, panel.isVisible, event.window === panel else { return event }
+            return self.handleRingScroll(event) ? nil : event
+        }
+    }
+
+    // 指针在环上时滚轮切换应用；在右侧列表内保留列表自身的滚动。
+    // 按“滚动意图”计数而不是按位移阈值：一次手势或一格滚轮只切一个应用，
+    // 首个位移立即生效，所以慢速不丢、快速也不会一次跨过多个应用。
+    private func handleRingScroll(_ event: NSEvent) -> Bool {
+        let precise = event.hasPreciseScrollingDeltas
+        guard let point = ringPoint(fromScreen: NSEvent.mouseLocation),
+              !WindowRingGeometry.listFrame.contains(point) else {
+            // 举手势边界时清理状态，避免手势在列表内开始/结束后续接错乱。
+            if precise, event.phase.contains(.began) || event.phase.contains(.ended)
+                || event.phase.contains(.cancelled) {
+                resetRingScrollGesture()
+            }
+            return false
+        }
+        // 抬手后的惯性属于上一次手势，直接吞掉，避免松手后继续切换。
+        if !event.momentumPhase.isEmpty || event.phase.contains(.mayBegin) { return true }
+
+        // 竖直方向为主；触控板横向滑动、妙控鼠标侧滑同样参与。
+        let vertical = precise ? event.scrollingDeltaY : (event.deltaY != 0 ? event.deltaY : event.scrollingDeltaY)
+        let horizontal = precise ? event.scrollingDeltaX : event.deltaX
+        let delta = abs(horizontal) > abs(vertical) ? horizontal : vertical
+        let now = ProcessInfo.processInfo.systemUptime
+
+        // 触控板/妙控鼠标用 phase 划分手势；没有 phase 的高精度滚轮按事件逐格处理。
+        if precise, !event.phase.isEmpty {
+            let idle = ringScrollGestureActive
+                && now - ringScrollGestureLastEventTime > RingScrollTuning.gestureIdleTimeout
+            if event.phase.contains(.began) || idle { resetRingScrollGesture() }
+            if delta != 0 {
+                if !ringScrollGestureActive {
+                    ringScrollGestureActive = true
+                    ringScrollGestureStepped = false
+                }
+                ringScrollGestureLastEventTime = now
+                if !ringScrollGestureStepped {
+                    ringScrollGestureStepped = true
+                    moveApplication(delta > 0 ? -1 : 1)
+                }
+            }
+            if event.phase.contains(.ended) || event.phase.contains(.cancelled) {
+                resetRingScrollGesture()
+            }
+            return true
+        }
+
+        // 鼠标滚轮每个事件就是一格：不再按冷却时间丢弃事件，
+        // 连续快速滚动也会逐格经过每个应用。
+        guard delta != 0 else { return false }
+        moveApplication(delta > 0 ? -1 : 1)
+        return true
+    }
+
+    private func resetRingScrollGesture() {
+        ringScrollGestureActive = false
+        ringScrollGestureStepped = false
+        ringScrollGestureLastEventTime = 0
+    }
+
+    private func ringPoint(fromScreen point: CGPoint) -> CGPoint? {
+        guard let panel = ringPanel else { return nil }
         // 屏幕坐标的 y 轴向上，SwiftUI 的 y 轴向下，统一到视图坐标后直接复用绘制路径。
-        let localPoint = CGPoint(x: (point.x - panel.frame.minX) / ringDisplayScale,
-                                 y: (panel.frame.maxY - point.y) / ringDisplayScale)
+        return CGPoint(x: (point.x - panel.frame.minX) / ringDisplayScale,
+                       y: (panel.frame.maxY - point.y) / ringDisplayScale)
+    }
+
+    // 环带（图标轨道到圆环边缘）内任意一点都按角度选中最近的应用。
+    private func selectRingApplication(atScreen point: CGPoint) -> Bool {
+        guard ringRequested, !applications.isEmpty, let local = ringPoint(fromScreen: point) else { return false }
         let center = WindowRingGeometry.center
-        if hypot(localPoint.x - center.x, localPoint.y - center.y) <= WindowRingGeometry.circleRadius { return true }
+        let offset = CGPoint(x: local.x - center.x, y: local.y - center.y)
+        let distance = hypot(offset.x, offset.y)
+        guard WindowRingGeometry.applicationHitRange(count: applications.count).contains(distance) else { return false }
+        let step = 2 * CGFloat.pi / CGFloat(applications.count)
+        let raw = (atan2(offset.y, offset.x) + .pi / 2) / step
+        let wrapped = raw.truncatingRemainder(dividingBy: CGFloat(applications.count))
+        let index = Int((wrapped < 0 ? wrapped + CGFloat(applications.count) : wrapped).rounded())
+        let app = applications[index % applications.count]
+        selectApplication(app.id)
+        return true
+    }
+
+    private func isRingContentPoint(_ point: CGPoint) -> Bool {
+        guard let localPoint = ringPoint(fromScreen: point) else { return false }
+        let hitSlop: CGFloat = 28
+        let center = WindowRingGeometry.center
+        if hypot(localPoint.x - center.x, localPoint.y - center.y) <= WindowRingGeometry.circleRadius + hitSlop {
+            return true
+        }
 
         let closeButton = CGRect(x: WindowRingGeometry.panelSize.width - 52, y: 0, width: 52, height: 52)
+            .insetBy(dx: -8, dy: -8)
         if closeButton.contains(localPoint) { return true }
 
-        guard let app = selectedApplication,
-              let appIndex = applications.firstIndex(where: { $0.id == app.id }) else { return false }
-        let baseAngle = 2 * CGFloat.pi * CGFloat(appIndex) / CGFloat(max(applications.count, 1)) - (.pi / 2)
-        let visibleRange = WindowRingGeometry.visibleWindowRange(count: app.windows.count, selectedIndex: selectedIndex)
-        return visibleRange.contains { index in
-            WindowRingGeometry.sector(baseAngle: baseAngle, index: index - visibleRange.lowerBound, count: visibleRange.count)
-                .path(in: CGRect(origin: .zero, size: WindowRingGeometry.panelSize)).contains(localPoint)
-        }
+        return WindowRingGeometry.listFrame.insetBy(dx: -hitSlop, dy: -hitSlop).contains(localPoint)
     }
 
     func moveApplication(_ offset: Int) {
@@ -382,6 +587,12 @@ final class WindowManager: NSObject, ObservableObject {
     func activateSelectedWindow() {
         guard let selectedWindow else { return }
         activate(selectedWindow)
+        dismissRing()
+    }
+
+    func activateRingWindow(_ id: String) {
+        guard let window = selectedApplication?.windows.first(where: { $0.id == id }) else { return }
+        activate(window)
         dismissRing()
     }
 
@@ -740,21 +951,40 @@ final class WindowManager: NSObject, ObservableObject {
             for application in running {
                 guard !Task.isCancelled, let self, self.refreshGeneration == generation else { return }
                 let pid = application.processIdentifier
-                if let time = self.windowCacheTimes[pid], now - time < self.windowCacheLifetime { continue }
+                let isInitialTarget = self.ringNeedsInitialSelection && pid == self.ringFrontmostPID
+                if !isInitialTarget, let time = self.windowCacheTimes[pid], now - time < self.windowCacheLifetime { continue }
                 let snapshot = await WindowAccessibilityReader.shared.read(pid: pid)
                 guard !Task.isCancelled, self.refreshGeneration == generation else { return }
                 if let snapshot, !application.isTerminated {
                     self.cache(snapshot, for: application)
                 }
+                if isInitialTarget {
+                    self.rebuildApplications()
+                    self.selectInitialRingWindow()
+                    self.presentRing()
+                }
             }
             guard let self, !Task.isCancelled, self.refreshGeneration == generation else { return }
             self.refreshTask = nil
             self.rebuildApplications()
+            self.selectInitialRingWindow()
             if self.ringRequested {
                 if self.applications.isEmpty { self.dismissRing() }
                 else { self.presentRing() }
             }
         }
+    }
+
+    private func selectInitialRingWindow() {
+        guard ringRequested, ringNeedsInitialSelection else { return }
+        ringNeedsInitialSelection = false
+        let app = ringFrontmostPID.flatMap { applicationsByID[String($0)] } ?? applications.first
+        selectedApplicationID = app?.id
+        let focusedID = app?.windows.first(where: { $0.isFocused && !$0.isMinimized })?.id
+            ?? ringFrontmostPID.flatMap { lastFocusedWindowByPID[$0] }
+                .flatMap { id in app?.windows.first(where: { $0.id == id && !$0.isMinimized })?.id }
+            ?? app?.windows.first(where: { !$0.isMinimized })?.id
+        selectedIndex = app?.windows.firstIndex(where: { $0.id == focusedID }) ?? 0
     }
 
     private func cache(_ snapshot: [AccessibilityWindow], for application: NSRunningApplication) {
@@ -821,7 +1051,7 @@ final class WindowManager: NSObject, ObservableObject {
 
     private func rebuildApplications() {
         let frontmostPID = ringRequested ? ringFrontmostPID : NSWorkspace.shared.frontmostApplication?.processIdentifier
-        let updated = windowCache.values.compactMap { windows -> WindowApplication? in
+        var groups = windowCache.values.compactMap { windows -> WindowApplication? in
             guard let first = windows.first else { return nil }
             let id = String(first.application.processIdentifier)
             let freeze = (ringRequested && ringPanel?.isVisible == true)
@@ -839,7 +1069,16 @@ final class WindowManager: NSObject, ObservableObject {
             }.map(\.element)
             return WindowApplication(id: id, name: first.applicationName,
                                      icon: first.applicationIcon, application: first.application, windows: ordered)
-        }.sorted { left, right in
+        }
+        // 当前应用未公开窗口时保留空列表，不能把操作转给另一个应用。
+        if ringRequested, let pid = ringFrontmostPID,
+           !groups.contains(where: { $0.application.processIdentifier == pid }),
+           let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+           app.activationPolicy == .regular, pid != ProcessInfo.processInfo.processIdentifier {
+            groups.append(WindowApplication(id: String(pid), name: app.localizedName ?? "Application",
+                                            icon: cachedIcon(for: app), application: app, windows: []))
+        }
+        let updated = groups.sorted { left, right in
             if ringRequested, ringPanel?.isVisible == true {
                 let a = applications.firstIndex(where: { $0.id == left.id }) ?? Int.max
                 let b = applications.firstIndex(where: { $0.id == right.id }) ?? Int.max
@@ -887,6 +1126,7 @@ final class WindowManager: NSObject, ObservableObject {
               let app = NSWorkspace.shared.frontmostApplication,
               app.activationPolicy == .regular,
               app.processIdentifier != ProcessInfo.processInfo.processIdentifier else { return }
+        lastExternalApplicationPID = app.processIdentifier
         if observedFocusPID != app.processIdentifier {
             stopFocusObservation()
             observedFocusPID = app.processIdentifier
@@ -1040,6 +1280,7 @@ final class WindowManager: NSObject, ObservableObject {
         panel.acceptsMouseMovedEvents = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
+        panel.handleKey = { [weak self] event in self?.handleRingKey(event) ?? false }
         return panel
     }
 
@@ -1056,6 +1297,11 @@ final class WindowManager: NSObject, ObservableObject {
         panel.hidesOnDeactivate = false
         panel.contentView = makeDockPreviewContent()
         panel.onMouseDown = { [weak self] in self?.preparePreviewInteraction() }
+        panel.handleKey = { [weak self] event in
+            guard let self, !self.isDockSearchComposing else { return false }
+            return self.handlePreviewKey(Int64(event.keyCode), text: event.characters ?? "",
+                                         flags: CGEventFlags(rawValue: UInt64(event.modifierFlags.rawValue)), fromSearch: true)
+        }
         return panel
     }
 
@@ -1200,4 +1446,9 @@ enum DockPreviewPlacement {
 enum WindowSide {
     case left
     case right
+}
+
+// 一次滚动手势只切一个应用；停顿超过该间隔后继续滚动，视为下一次手势。
+private enum RingScrollTuning {
+    static let gestureIdleTimeout: TimeInterval = 0.25
 }

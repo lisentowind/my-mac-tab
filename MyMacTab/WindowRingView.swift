@@ -3,463 +3,286 @@ import SwiftUI
 
 struct WindowRingView: View {
     @ObservedObject var manager: WindowManager
+    @ObservedObject private var shortcuts = ShortcutConfiguration.shared
     let displayScale: CGFloat
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @FocusState private var isFocused: Bool
-    @State private var windowBaseAngle: CGFloat?
-
-    private let ringCenter = WindowRingGeometry.center
+    @State private var keyboardPointer: CGPoint? = NSEvent.mouseLocation
 
     var body: some View {
-        ringContent
-        .focusable()
-        .focused($isFocused)
-        // 保留方向键焦点，关闭系统沿透明浮层矩形绘制的蓝色焦点边框。
-        .focusEffectDisabled()
-        .onAppear { isFocused = true }
-        .onChange(of: manager.isRingPresented) { _, isPresented in
-            if isPresented { isFocused = true }
-            else { windowBaseAngle = nil }
-        }
-        .onChange(of: manager.selectedApplicationID) { _, _ in
-            guard let index = manager.applications.firstIndex(where: { $0.id == manager.selectedApplication?.id }) else { return }
-            let angle = appAngle(index: index, count: manager.applications.count)
-            if let current = windowBaseAngle, abs(atan2(sin(angle - current), cos(angle - current))) < 0.001 { return }
-            // 键盘切换直接对齐；hover 在 selectApplication 中设置连续角度和动画。
-            windowBaseAngle = angle
-        }
-        .onChange(of: manager.applications.map(\.id)) { _, _ in
-            if let index = manager.applications.firstIndex(where: { $0.id == manager.selectedApplication?.id }) {
-                windowBaseAngle = appAngle(index: index, count: manager.applications.count)
+        ZStack {
+            applicationRing
+            windowList
+                .frame(width: WindowRingGeometry.listFrame.width, height: WindowRingGeometry.listFrame.height)
+                .position(x: WindowRingGeometry.listFrame.midX, y: WindowRingGeometry.listFrame.midY)
+                .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: manager.selectedApplicationID)
+            Button(action: manager.dismissRing) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 26, height: 26)
+                    .background(.white.opacity(0.08), in: Circle())
             }
+            .buttonStyle(RingControlStyle())
+            .help("关闭 · \(shortcuts.binding(for: .dismissOverlay).displayName)")
+            .position(x: WindowRingGeometry.panelSize.width - 26, y: 22)
         }
-        .onKeyPress(.leftArrow, phases: [.down, .repeat]) { key in
-            if key.modifiers.contains(.option) { manager.splitSelectedWindow(to: .left) }
-            else { manager.moveApplication(-1) }
-            return .handled
-        }
-        .onKeyPress(.rightArrow, phases: [.down, .repeat]) { key in
-            if key.modifiers.contains(.option) { manager.splitSelectedWindow(to: .right) }
-            else { manager.moveApplication(1) }
-            return .handled
-        }
-        .onKeyPress(.upArrow) { manager.moveWindow(-1); return .handled }
-        .onKeyPress(.downArrow) { manager.moveWindow(1); return .handled }
-        .onKeyPress(.escape) { manager.dismissRing(); return .handled }
-        .onKeyPress(.return) { manager.activateSelectedWindow(); return .handled }
+        .foregroundStyle(.white)
+        .frame(width: WindowRingGeometry.panelSize.width, height: WindowRingGeometry.panelSize.height)
+        .opacity(manager.isRingPresented ? 1 : 0)
+        .scaleEffect(displayScale)
+        .frame(width: WindowRingGeometry.panelSize.width * displayScale,
+               height: WindowRingGeometry.panelSize.height * displayScale)
+        .onChange(of: manager.selectedIndex) { _, _ in keyboardPointer = NSEvent.mouseLocation }
+        .onChange(of: manager.selectedApplicationID) { _, _ in keyboardPointer = NSEvent.mouseLocation }
     }
 
-    private var ringContent: some View {
+    private var applicationRing: some View {
         ZStack {
             AdaptiveWindowSurface(shape: Circle(),
                                   tint: Color(red: 0.18, green: 0.28, blue: 0.6).opacity(0.42),
                                   opaqueColor: Color(red: 0.19, green: 0.28, blue: 0.56))
                 .frame(width: WindowRingGeometry.circleRadius * 2, height: WindowRingGeometry.circleRadius * 2)
-                .shadow(color: .black.opacity(0.18), radius: 24, y: 12)
-                .position(ringCenter)
-
-            Circle()
-                .strokeBorder(.white.opacity(0.045), lineWidth: 1)
+                .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+                .position(WindowRingGeometry.center)
+            Circle().strokeBorder(.white.opacity(0.07), style: StrokeStyle(lineWidth: 1, dash: [3, 4]))
                 .frame(width: WindowRingGeometry.appRadius * 2, height: WindowRingGeometry.appRadius * 2)
-                .position(ringCenter)
-
+                .position(WindowRingGeometry.center)
             Circle()
                 .fill(LinearGradient(colors: [Color(red: 0.1, green: 0.19, blue: 0.48).opacity(0.38),
                                              Color(red: 0.06, green: 0.13, blue: 0.38).opacity(0.54)],
                                      startPoint: .top, endPoint: .bottom))
-                .frame(width: WindowRingGeometry.centerRadius * 2, height: WindowRingGeometry.centerRadius * 2)
-                .overlay(Circle().strokeBorder(.white.opacity(0.1), lineWidth: 1))
-                .position(ringCenter)
-
+                .frame(width: 170, height: 170)
+                .overlay(Circle().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+                .position(WindowRingGeometry.center)
             ForEach(Array(manager.applications.enumerated()), id: \.element.id) { index, app in
-                appIcon(app)
-                    .position(position(for: index, count: manager.applications.count))
+                applicationIcon(app, count: manager.applications.count)
+                    .position(WindowRingGeometry.applicationPosition(index: index, count: manager.applications.count))
             }
-
-            centerContent
-                .frame(width: 216, height: 220)
-                .position(ringCenter)
-
-            windowCards
-        }
-        .opacity(manager.isRingPresented ? 1 : 0)
-        .overlay(alignment: .topTrailing) {
-            Button(action: manager.dismissRing) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.75))
-                    .frame(width: 28, height: 28)
-                    .background(.white.opacity(0.08), in: Circle())
+            VStack(spacing: 10) {
+                Image(systemName: "square.grid.2x2")
+                    .font(.system(size: 15, weight: .medium)).foregroundStyle(.white.opacity(0.55))
+                Text(manager.selectedApplication?.name ?? "暂无窗口")
+                    .font(.system(size: 18, weight: .semibold))
+                    .lineLimit(2).minimumScaleFactor(0.7).multilineTextAlignment(.center)
+                Text("\(shortcuts.binding(for: .previousApplication).displayName)  \(shortcuts.binding(for: .nextApplication).displayName)  或滚轮切换应用")
+                    .font(.system(size: 9, weight: .medium)).foregroundStyle(.white.opacity(0.55))
+                    .lineLimit(2).multilineTextAlignment(.center)
             }
-            .buttonStyle(RingControlStyle())
-            .accessibilityLabel("关闭窗口环")
-            .help("关闭 · Esc")
-            .padding(18)
+            .frame(width: 140, height: 140).position(WindowRingGeometry.center)
+            Label("\(manager.applications.count) 个运行中应用", systemImage: "circle.fill")
+                .font(.system(size: 11, weight: .medium)).foregroundStyle(.white.opacity(0.6))
+                .position(x: WindowRingGeometry.center.x, y: 444)
         }
-        .frame(width: WindowRingGeometry.panelSize.width,
-               height: WindowRingGeometry.panelSize.height)
-        .scaleEffect(displayScale)
-        .frame(width: WindowRingGeometry.panelSize.width * displayScale,
-               height: WindowRingGeometry.panelSize.height * displayScale)
-        .background(Color.clear)
     }
 
-    private func appIcon(_ app: WindowApplication) -> some View {
-        let isSelected = app.id == manager.selectedApplication?.id
-        return Button {
-            selectApplication(app.id)
-        } label: {
-            ZStack(alignment: .topTrailing) {
-                Image(nsImage: app.icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 64, height: 64)
-                    .padding(7)
-                    .background(.white.opacity(isSelected ? 0.12 : 0),
-                                in: RoundedRectangle(cornerRadius: 18))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18)
-                            .strokeBorder(.white.opacity(isSelected ? 0.44 : 0), lineWidth: 1.25)
+    private func applicationIcon(_ app: WindowApplication, count: Int) -> some View {
+        let selected = app.id == manager.selectedApplication?.id
+        let side = WindowRingGeometry.iconSize(count: count)
+        return Button { selectApplication(app.id) } label: {
+            Image(nsImage: app.icon).resizable().interpolation(.high)
+                .frame(width: side, height: side).padding(5)
+                .background(.white.opacity(selected ? 0.13 : 0), in: RoundedRectangle(cornerRadius: 13))
+                .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(.white.opacity(selected ? 0.5 : 0), lineWidth: 1.5))
+                .overlay(alignment: .topTrailing) {
+                    if app.windows.count > 1 {
+                        Text("\(app.windows.count)")
+                            .font(.system(size: 9, weight: .semibold, design: .rounded))
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Color(red: 0.94, green: 0.28, blue: 0.33), in: Capsule())
+                            .offset(x: 3, y: -3)
                     }
-                if app.windows.count > 1 {
-                    Text("\(app.windows.count)")
-                        .font(.system(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .frame(minWidth: 19, minHeight: 19)
-                        .background(Color(red: 0.94, green: 0.28, blue: 0.33), in: Capsule())
-                        .overlay(Capsule().strokeBorder(.white.opacity(0.16), lineWidth: 1))
-                        .offset(x: 3, y: -3)
                 }
-            }
-            .shadow(color: .black.opacity(isSelected ? 0.22 : 0.10), radius: isSelected ? 10 : 4, y: 3)
-            .scaleEffect(isSelected ? 1.14 : 1)
-            .frame(width: 86, height: 86)
-            .contentShape(Rectangle())
+                .scaleEffect(selected ? 1.1 : 1)
+                .animation(reduceMotion ? nil : .spring(response: 0.24, dampingFraction: 1), value: selected)
+                // 视觉尺寸不变，额外留白只扩大点击命中区，避免贴着图标点偏。
+                .padding(WindowRingGeometry.iconHitPadding)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onHover { isHovering in
-            if isHovering { selectApplication(app.id) }
-        }
         .accessibilityLabel("\(app.name)，\(app.windows.count) 个窗口")
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
-        .help(app.name)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .help("点击切换到 \(app.name)")
     }
 
-    private var centerContent: some View {
-        VStack(spacing: 10) {
+    private var windowList: some View {
+        VStack(spacing: 0) {
             if let app = manager.selectedApplication {
-                Text(app.name)
-                    .font(.system(size: 23, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.94))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-                    .frame(maxWidth: 180)
-                    .id(app.id)
-                    .transition(.opacity)
-                Text(manager.selectedWindow?.title ?? "")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.68))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .truncationMode(.middle)
-                    .frame(width: 176, height: 32)
-
                 HStack(spacing: 10) {
-                    windowNavigationButton(offset: -1, symbol: "chevron.left")
-                    Text("\(manager.selectedIndex + 1) / \(app.windows.count)")
-                        .font(.system(size: 12, weight: .medium, design: .rounded))
-                        .monospacedDigit()
-                        .foregroundStyle(.white.opacity(0.88))
-                        .padding(.horizontal, 12)
-                        .frame(height: 26)
-                        .background(.white.opacity(0.09), in: Capsule())
-                    windowNavigationButton(offset: 1, symbol: "chevron.right")
+                    Image(nsImage: app.icon).resizable().frame(width: 30, height: 30)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(app.name).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                        Text("\(app.windows.count) 个窗口")
+                            .font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 4)
+                    navigationButton(-1, "chevron.left")
+                    Text("\(app.windows.isEmpty ? 0 : manager.selectedIndex + 1) / \(app.windows.count)")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced)).monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    navigationButton(1, "chevron.right")
                 }
-
-                HStack(spacing: 12) {
-                    Text("← → 应用")
-                    Text("↑ ↓ 窗口")
-                    Text("↵ 打开")
+                .padding(.horizontal, 16).frame(height: 72)
+                Divider().padding(.horizontal, 16)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 4) {
+                            ForEach(Array(app.windows.enumerated()), id: \.element.id) { index, window in
+                                windowRow(window, index: index)
+                                    .id(window.id)
+                            }
+                        }.padding(8)
+                    }
+                    .overlay {
+                        if app.windows.isEmpty {
+                            ContentUnavailableView("暂无可用窗口", systemImage: "macwindow",
+                                                   description: Text("此应用暂未提供可管理的窗口"))
+                        }
+                    }
+                    .scrollIndicators(.automatic)
+                    .onAppear {
+                        if let window = manager.selectedWindow { proxy.scrollTo(window.id) }
+                    }
+                    .onChange(of: manager.selectedIndex) { _, _ in
+                        if let window = manager.selectedWindow { proxy.scrollTo(window.id) }
+                    }
+                    .onChange(of: app.id) { _, _ in
+                        if let window = manager.selectedWindow { proxy.scrollTo(window.id, anchor: .top) }
+                    }
                 }
-                .font(.system(size: 9, weight: .medium))
-                .foregroundStyle(.white.opacity(0.5))
-            } else {
-                Text("暂无打开的窗口")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.7))
+                Divider().padding(.horizontal, 16)
+                HStack(spacing: 8) {
+                    Text("\(shortcuts.binding(for: .previousWindow).displayName) \(shortcuts.binding(for: .nextWindow).displayName) 选择")
+                    Text("\(shortcuts.binding(for: .activateWindow).displayName) 打开")
+                    Spacer(minLength: 0)
+                    Text("\(shortcuts.binding(for: .dismissOverlay).displayName) 关闭")
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .padding(.horizontal, 14).frame(height: 36)
             }
         }
-        .padding(.vertical, 12)
+        .foregroundStyle(.primary)
+        .background { AdaptiveWindowSurface(shape: RoundedRectangle(cornerRadius: 20, style: .continuous)) }
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
     }
 
-    private func windowNavigationButton(offset: Int, symbol: String) -> some View {
+    private func windowRow(_ window: ManagedWindow, index: Int) -> some View {
+        let selected = manager.selectedIndex == index
+        return RingWindowRow(window: window, selected: selected) {
+            manager.activateRingWindow(window.id)
+        }
+        .onHover { inside in
+            if inside, keyboardPointer != NSEvent.mouseLocation { manager.selectWindow(index) }
+        }
+        .accessibilityLabel("窗口 \(index + 1)：\(window.title)")
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+        .help(window.title)
+    }
+
+    private func navigationButton(_ offset: Int, _ symbol: String) -> some View {
         Button { manager.moveWindow(offset) } label: {
-            Image(systemName: symbol)
-                .font(.system(size: 9, weight: .semibold))
-                .foregroundStyle(.white.opacity(0.75))
-                .frame(width: 26, height: 26)
-                .background(.white.opacity(0.06), in: Circle())
+            Image(systemName: symbol).font(.system(size: 10, weight: .semibold))
+                .frame(width: 24, height: 26)
+                .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(RingControlStyle())
         .disabled((manager.selectedApplication?.windows.count ?? 0) < 2)
         .accessibilityLabel(offset < 0 ? "上一个窗口" : "下一个窗口")
-        .help(offset < 0 ? "上一个窗口 · ↑" : "下一个窗口 · ↓")
-    }
-
-    private var windowCards: some View {
-        Group {
-            if let app = manager.selectedApplication,
-               let appIndex = manager.applications.firstIndex(where: { $0.id == app.id }) {
-                let baseAngle = windowBaseAngle ?? appAngle(index: appIndex, count: manager.applications.count)
-                let visibleRange = WindowRingGeometry.visibleWindowRange(count: app.windows.count,
-                                                                         selectedIndex: manager.selectedIndex)
-                ZStack {
-                    // 所有扇片共用一个模糊层，窗口数增加时不增加玻璃材质层数。
-                    AdaptiveWindowSurface(
-                        shape: WindowFanBackdrop(baseAngle: baseAngle,
-                                                 step: WindowRingGeometry.sectorStep(count: visibleRange.count),
-                                                 count: visibleRange.count),
-                        tint: Color(red: 0.2, green: 0.32, blue: 0.6).opacity(0.3),
-                        opaqueColor: Color(red: 0.18, green: 0.28, blue: 0.5)
-                    )
-                    // 用扇片位置保持身份，切换 App 时圆弧可以从旧角度连续移动到新角度。
-                    ForEach(Array(visibleRange.enumerated()), id: \.offset) { slot, index in
-                        let window = app.windows[index]
-                        let angle = WindowRingGeometry.windowAngle(baseAngle: baseAngle,
-                                                                 index: slot, count: visibleRange.count)
-                        let sector = WindowRingGeometry.sector(baseAngle: baseAngle,
-                                                              index: slot, count: visibleRange.count)
-                        let isSelected = index == manager.selectedIndex
-                        Button {
-                            manager.selectWindow(index)
-                            manager.activateSelectedWindow()
-                        } label: {
-                            ZStack {
-                                sector
-                                    .fill(LinearGradient(
-                                        colors: [Color(red: 0.34, green: 0.47, blue: 0.77)
-                                                    .opacity(isSelected ? 0.5 : 0.15),
-                                                 Color(red: 0.14, green: 0.26, blue: 0.52)
-                                                    .opacity(isSelected ? 0.6 : 0.25)],
-                                        startPoint: .topLeading, endPoint: .bottomTrailing
-                                    ))
-                                    .overlay {
-                                        sector.stroke(.white.opacity(isSelected ? 0.5 : 0.18),
-                                                      lineWidth: isSelected ? 1.5 : 1)
-                                    }
-                                VStack(spacing: 6) {
-                                    HStack(spacing: 5) {
-                                        Image(systemName: isSelected ? "checkmark.circle.fill" : "macwindow")
-                                            .font(.system(size: 10, weight: .medium))
-                                        Text(String(format: "%02d", index + 1))
-                                            .font(.system(size: 9, weight: .semibold, design: .rounded))
-                                            .monospacedDigit()
-                                    }
-                                    .foregroundStyle(.white.opacity(isSelected ? 0.92 : 0.48))
-                                    Text(window.title)
-                                        .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
-                                        .lineLimit(3)
-                                        .truncationMode(.middle)
-                                        .multilineTextAlignment(.center)
-                                        .foregroundStyle(.white.opacity(isSelected ? 0.98 : 0.78))
-                                }
-                                .id(window.id)
-                                .transition(.opacity)
-                                .modifier(WindowRingLabelPosition(angle: angle, count: visibleRange.count))
-                            }
-                            .frame(width: WindowRingGeometry.panelSize.width,
-                                   height: WindowRingGeometry.panelSize.height)
-                            // 透明矩形不拦截其他 App；整个扇区（包括文字周围）都支持 hover 和点击。
-                            .contentShape(sector)
-                        }
-                        .buttonStyle(.plain)
-                        .onHover { isHovering in
-                            if isHovering {
-                                withAnimation(.easeOut(duration: 0.14)) { manager.selectWindow(index) }
-                            }
-                        }
-                        .transition(.opacity.combined(with: .scale(scale: reduceMotion ? 1 : 0.97)))
-                        .accessibilityLabel("窗口 \(index + 1)：\(window.title)")
-                        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
-                        .help(window.title)
-                    }
-                }
-            }
-        }
     }
 
     private func selectApplication(_ id: String) {
-        let apps = manager.applications
-        guard manager.selectedApplication?.id != id, let index = apps.firstIndex(where: { $0.id == id }) else { return }
-        let target = appAngle(index: index, count: apps.count)
-        let currentIndex = apps.firstIndex(where: { $0.id == manager.selectedApplication?.id }) ?? index
-        let current = windowBaseAngle ?? appAngle(index: currentIndex, count: apps.count)
-        var transaction = Transaction(animation: reduceMotion ? nil : .spring(response: 0.24, dampingFraction: 1))
-        transaction.disablesAnimations = reduceMotion
-        withTransaction(transaction) {
-            // 顶部两侧的图标之间走最短圆弧，避免跨越 0/2π 时扇片绕一整圈。
-            windowBaseAngle = current + atan2(sin(target - current), cos(target - current))
-            manager.selectApplication(id)
+        keyboardPointer = NSEvent.mouseLocation
+        manager.selectApplication(id)
+    }
+}
+
+private struct RingWindowRow: View {
+    let window: ManagedWindow
+    let selected: Bool
+    let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: window.isMinimized ? "minus.rectangle" : "macwindow")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundStyle(selected ? Color.white.opacity(0.9) : Color.secondary)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(window.title)
+                        .font(.system(size: 12, weight: .medium))
+                        .lineLimit(2).truncationMode(.middle)
+                    Text(window.isMinimized ? "已最小化" : window.isFocused ? "当前窗口" : "点击打开窗口")
+                        .font(.system(size: 10))
+                        .foregroundStyle(selected ? Color.white.opacity(0.8) : Color.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: "return")
+                    .font(.system(size: 11, weight: .medium))
+                    .opacity(selected ? 0.8 : 0)
+                    .frame(width: 16)
+            }
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            .frame(maxWidth: .infinity, minHeight: 62, alignment: .leading)
+            .background(selected ? Color(nsColor: .selectedContentBackgroundColor) : .clear,
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay {
+                if selected && contrast == .increased {
+                    RoundedRectangle(cornerRadius: 10).strokeBorder(.white.opacity(0.8), lineWidth: 1)
+                }
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+            .animation(.easeOut(duration: reduceMotion ? 0.08 : 0.14), value: selected)
         }
+        .buttonStyle(RingWindowRowStyle())
+        .focusEffectDisabled()
     }
+}
 
-    private func position(for index: Int, count: Int) -> CGPoint {
-        pointOnRing(radius: WindowRingGeometry.appRadius, angle: appAngle(index: index, count: count))
-    }
+private struct RingWindowRowStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private func appAngle(index: Int, count: Int) -> CGFloat {
-        (2 * CGFloat.pi * CGFloat(index) / CGFloat(max(count, 1))) - (.pi / 2)
-    }
-
-    private func pointOnRing(radius: CGFloat, angle: CGFloat) -> CGPoint {
-        CGPoint(x: ringCenter.x + cos(angle) * radius,
-                y: ringCenter.y + sin(angle) * radius)
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.78 : 1)
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 1),
+                       value: configuration.isPressed)
     }
 }
 
 private struct RingControlStyle: ButtonStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.isEnabled) private var isEnabled
-
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(!isEnabled ? 0.3 : configuration.isPressed ? 0.65 : 1)
+        configuration.label.opacity(!isEnabled ? 0.3 : configuration.isPressed ? 0.65 : 1)
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.94 : 1)
     }
 }
 
-// 文字沿与扇片相同的圆弧移动；直接插值 CGPoint 会走弦线，短暂漂进圆环内部。
-private struct WindowRingLabelPosition: AnimatableModifier {
-    var angle: CGFloat
-    let count: Int
-
-    var animatableData: CGFloat {
-        get { angle }
-        set { angle = newValue }
-    }
-
-    func body(content: Content) -> some View {
-        content
-            .frame(width: WindowRingGeometry.labelWidth(angle: angle, count: count), height: 68)
-            .position(x: WindowRingGeometry.center.x + cos(angle) * WindowRingGeometry.labelRadius,
-                      y: WindowRingGeometry.center.y + sin(angle) * WindowRingGeometry.labelRadius)
-    }
-}
-
-// 视图、透明浮层尺寸和外部点击命中共用几何，避免扇片被裁切或点击扇片误关闭。
 nonisolated enum WindowRingGeometry {
-    static let panelSize = CGSize(width: 1000, height: 920)
-    static let center = CGPoint(x: panelSize.width / 2, y: panelSize.height / 2)
-    static let appRadius: CGFloat = 194
-    static let circleRadius: CGFloat = 285
-    static let centerRadius: CGFloat = 122
-    static let innerRadius: CGFloat = 300
-    static let outerRadius: CGFloat = 440
-    static let labelRadius: CGFloat = 370
-    static let maximumVisibleWindows = 5
+    static let panelSize = CGSize(width: 750, height: 470)
+    static let center = CGPoint(x: 194, y: 230)
+    static let circleRadius: CGFloat = 174
+    static let appRadius: CGFloat = 130
+    static let listFrame = CGRect(x: 398, y: 58, width: 316, height: 354)
+    static let iconHitPadding: CGFloat = 9
 
-    static func visibleWindowRange(count: Int, selectedIndex: Int) -> Range<Int> {
-        guard count > 0 else { return 0..<0 }
-        let selected = min(max(selectedIndex, 0), count - 1)
-        let start = selected / maximumVisibleWindows * maximumVisibleWindows
-        return start..<min(start + maximumVisibleWindows, count)
+    static func iconSize(count: Int) -> CGFloat {
+        min(48, max(18, 2 * .pi * appRadius / CGFloat(max(count, 1)) - 18))
     }
 
-    static func sectorStep(count: Int) -> CGFloat {
-        min(0.62, 2.4 / CGFloat(max(count, 1)))
+    // 环带整段可点：图标轨道两侧留白也算命中，避免点到图标之间的空隙毫无反应。
+    static func applicationHitRange(count: Int) -> ClosedRange<CGFloat> {
+        let inner = max(0, appRadius - iconSize(count: count) / 2 - 20)
+        return inner...circleRadius
     }
 
-    static func windowAngle(baseAngle: CGFloat, index: Int, count: Int) -> CGFloat {
-        // 扇片围绕 App 的方向对称展开；同一页内的 hover 不重排位置。
-        baseAngle + (CGFloat(index) - CGFloat(max(count - 1, 0)) / 2) * sectorStep(count: count)
-    }
-
-    static func labelWidth(angle: CGFloat, count: Int) -> CGFloat {
-        // 水平文字框同时满足径向厚度和扇区角度；侧面、斜角的文字不会溢出扇片。
-        let horizontal = abs(cos(angle))
-        let vertical = abs(sin(angle))
-        let halfHeight: CGFloat = 34
-        let radialBudget = min(labelRadius - innerRadius, outerRadius - labelRadius) - 8
-        let tangentialBudget = innerRadius * tan(sectorStep(count: count) * 0.47 - 0.02)
-        let radialWidth = horizontal > 0.001 ? 2 * (radialBudget - vertical * halfHeight) / horizontal : 164
-        let tangentialWidth = vertical > 0.001 ? 2 * (tangentialBudget - horizontal * halfHeight) / vertical : 164
-        return min(164, min(radialWidth, tangentialWidth))
-    }
-
-    static func sector(baseAngle: CGFloat, index: Int, count: Int) -> FanWindowSector {
-        let angle = windowAngle(baseAngle: baseAngle, index: index, count: count)
-        let halfAngle = sectorStep(count: count) * 0.47
-        return FanWindowSector(center: center, innerRadius: innerRadius, outerRadius: outerRadius,
-                               startAngle: angle - halfAngle, endAngle: angle + halfAngle)
-    }
-}
-
-nonisolated struct FanWindowSector: Shape {
-    let center: CGPoint
-    let innerRadius: CGFloat
-    let outerRadius: CGFloat
-    let startAngle: CGFloat
-    let endAngle: CGFloat
-
-    var animatableData: AnimatablePair<CGFloat, CGFloat> {
-        get { AnimatablePair(startAngle, endAngle) }
-        set { self = FanWindowSector(center: center, innerRadius: innerRadius, outerRadius: outerRadius,
-                                     startAngle: newValue.first, endAngle: newValue.second) }
-    }
-
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        let corner = min(12, innerRadius * (endAngle - startAngle) / 4)
-        let innerInset = corner / innerRadius
-        let outerInset = corner / outerRadius
-        let point: (CGFloat, CGFloat) -> CGPoint = { radius, angle in
-            CGPoint(x: center.x + cos(angle) * radius, y: center.y + sin(angle) * radius)
-        }
-
-        // 内外边缘是共圆心的真圆弧；用二次曲线收圆四个角，匹配参考图的环形扇片。
-        path.move(to: point(innerRadius + corner, startAngle))
-        path.addLine(to: point(outerRadius - corner, startAngle))
-        path.addQuadCurve(to: point(outerRadius, startAngle + outerInset),
-                          control: point(outerRadius, startAngle))
-        path.addArc(center: center, radius: outerRadius,
-                    startAngle: .radians(Double(startAngle + outerInset)),
-                    endAngle: .radians(Double(endAngle - outerInset)), clockwise: false)
-        path.addQuadCurve(to: point(outerRadius - corner, endAngle),
-                          control: point(outerRadius, endAngle))
-        path.addLine(to: point(innerRadius + corner, endAngle))
-        path.addQuadCurve(to: point(innerRadius, endAngle - innerInset),
-                          control: point(innerRadius, endAngle))
-        path.addArc(center: center, radius: innerRadius,
-                    startAngle: .radians(Double(endAngle - innerInset)),
-                    endAngle: .radians(Double(startAngle + innerInset)), clockwise: true)
-        path.addQuadCurve(to: point(innerRadius + corner, startAngle),
-                          control: point(innerRadius, startAngle))
-        path.closeSubpath()
-        return path
-    }
-}
-
-private nonisolated struct WindowFanBackdrop: Shape {
-    var baseAngle: CGFloat
-    var step: CGFloat
-    let count: Int
-
-    var animatableData: AnimatablePair<CGFloat, CGFloat> {
-        get { AnimatablePair(baseAngle, step) }
-        set { baseAngle = newValue.first; step = newValue.second }
-    }
-
-    func path(in rect: CGRect) -> Path {
-        var path = Path()
-        for index in 0..<count {
-            let angle = baseAngle + (CGFloat(index) - CGFloat(max(count - 1, 0)) / 2) * step
-            path.addPath(FanWindowSector(center: WindowRingGeometry.center,
-                                         innerRadius: WindowRingGeometry.innerRadius,
-                                         outerRadius: WindowRingGeometry.outerRadius,
-                                         startAngle: angle - step * 0.47,
-                                         endAngle: angle + step * 0.47).path(in: rect))
-        }
-        return path
+    static func applicationPosition(index: Int, count: Int) -> CGPoint {
+        let angle = 2 * CGFloat.pi * CGFloat(index) / CGFloat(max(count, 1)) - .pi / 2
+        return CGPoint(x: center.x + cos(angle) * appRadius, y: center.y + sin(angle) * appRadius)
     }
 }
 
@@ -510,6 +333,7 @@ enum DockPreviewGeometry {
 
 struct DockWindowPreviewView: View {
     @ObservedObject var manager: WindowManager
+    @ObservedObject private var shortcuts = ShortcutConfiguration.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     private var app: WindowApplication? {
         manager.dockPreviewApplication
@@ -638,10 +462,10 @@ struct DockWindowPreviewView: View {
 
             HStack(spacing: 6) {
                 if manager.isDockKeyboardAvailable || manager.isDockSearchEditing {
-                    Text("↑↓ 选择")
-                    Text("↵ 打开")
+                    Text("\(shortcuts.binding(for: .previewPreviousWindow).displayName)\(shortcuts.binding(for: .previewNextWindow).displayName) 选择")
+                    Text("\(shortcuts.binding(for: .previewOpenWindow).displayName) 打开")
                     Spacer(minLength: 0)
-                    Text("Esc 退出")
+                    Text("\(shortcuts.binding(for: .previewDismiss).displayName) 退出")
                 } else {
                     Text("点击搜索框，使用键盘浏览")
                     Spacer(minLength: 0)
@@ -808,8 +632,10 @@ private struct WindowActionButtonStyle: ButtonStyle {
 final class DockPreviewPanel: NSPanel {
     var allowsKeyboardFocus = false
     var onMouseDown: (() -> Void)?
+    var handleKey: ((NSEvent) -> Bool)?
     override func sendEvent(_ event: NSEvent) {
         if event.type == .leftMouseDown || event.type == .rightMouseDown { onMouseDown?() }
+        if event.type == .keyDown, handleKey?(event) == true { return }
         super.sendEvent(event)
     }
     override var canBecomeKey: Bool { allowsKeyboardFocus }
@@ -817,6 +643,19 @@ final class DockPreviewPanel: NSPanel {
 }
 
 final class RingPanel: NSPanel {
+    var handleKey: ((NSEvent) -> Bool)?
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, handleKey?(event) == true { return }
+        super.sendEvent(event)
+    }
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+}
+
+// 玻璃背景用了 allowsHitTesting(false)，圆环内的空白处 hitTest 会返回 nil，
+// 系统随即把点击与滚轮转给下层窗口。这里兜底返回自身，保证整个面板都能收到鼠标和滚轮。
+final class RingContentView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) ?? self
+    }
 }

@@ -7,7 +7,8 @@ final class GlobalHotKey {
     private var handlerRef: EventHandlerRef?
     private var action: (() -> Void)?
 
-    func register(action: @escaping () -> Void) {
+    @discardableResult func register(binding: ShortcutBinding, action: @escaping () -> Void) -> OSStatus {
+        unregister()
         self.action = action
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
@@ -18,11 +19,13 @@ final class GlobalHotKey {
             Task { @MainActor in hotKey.action?() }
             return noErr
         }, 1, &eventType, userData, &handlerRef)
-        guard status == noErr else { return }
+        guard status == noErr else { return status }
 
         let identifier = EventHotKeyID(signature: OSType(0x4D4D5442), id: 1)
-        _ = RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), identifier,
-                                GetApplicationEventTarget(), 0, &hotKeyRef)
+        let registrationStatus = RegisterEventHotKey(UInt32(binding.keyCode), binding.carbonModifiers, identifier,
+                                                     GetApplicationEventTarget(), 0, &hotKeyRef)
+        if registrationStatus != noErr { unregister() }
+        return registrationStatus
     }
 
     func unregister() {

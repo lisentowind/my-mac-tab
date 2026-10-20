@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 
-// 只在预览显示期间安装；指针不在面板内时原样放行所有按键，不改变应用焦点。
+// 只在浮层显示期间安装；面板没有键盘焦点时也能收到按键，回调返回 true 的按键会被吞掉。
 @MainActor
 final class PreviewKeyboardMonitor {
     private var tap: CFMachPort?

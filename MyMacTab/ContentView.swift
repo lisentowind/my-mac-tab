@@ -10,6 +10,7 @@ struct ContentView: View {
     var body: some View {
         TabView {
             general.tabItem { Label("通用", systemImage: "slider.horizontal.3") }
+            ShortcutSettingsView().tabItem { Label("快捷键", systemImage: "keyboard") }
             preview.tabItem { Label("窗口预览", systemImage: "rectangle.on.rectangle") }
             applications.tabItem { Label("应用", systemImage: "square.grid.2x2") }
         }
@@ -49,10 +50,7 @@ struct ContentView: View {
                 .padding(.vertical, 6)
             }
             Section("键盘快捷键") {
-                shortcut("呼出窗口环", key: "⌃ ⌥ Space")
-                shortcut("切换应用 / 窗口", key: "← → / ↑ ↓")
-                shortcut("打开选中的窗口 / 退出", key: "↵ / Esc")
-                shortcut("窗口左半屏 / 右半屏", key: "⌥ ← / ⌥ →")
+                Text("在「快捷键」页自定义呼出窗口环、切换应用和窗口、窗口操作及菜单快捷键。")
             }
             Section("辅助功能") {
                 HStack {
