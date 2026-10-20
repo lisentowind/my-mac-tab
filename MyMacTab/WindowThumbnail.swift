@@ -125,10 +125,13 @@ final class WindowThumbnailPresenter: ObservableObject {
     private var requestedID: String?
     private var anchor: CGRect?
     private var obstacles: [CGRect] = []
+    private var level: NSWindow.Level = .floating
 
-    func updateAnchor(_ frame: CGRect, avoiding obstacles: [CGRect]) {
+    func updateAnchor(_ frame: CGRect, avoiding obstacles: [CGRect], level: NSWindow.Level = .floating) {
         anchor = frame
         self.obstacles = obstacles
+        self.level = level
+        panel?.level = level
         if panel?.isVisible == true { position() }
     }
 
@@ -217,7 +220,7 @@ final class WindowThumbnailPresenter: ObservableObject {
                                          backing: .buffered, defer: false)
             panel.backgroundColor = .clear
             panel.isOpaque = false
-            panel.level = .floating
+            panel.level = level
             panel.hasShadow = true
             panel.hidesOnDeactivate = false
             panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]

@@ -18,6 +18,9 @@ final class PreviewKeyboardMonitor {
                                          options: .defaultTap, eventsOfInterest: CGEventMask(mask),
                                          callback: { _, type, event, context in
             guard let context else { return Unmanaged.passUnretained(event) }
+            if event.getIntegerValueField(.eventSourceUserData) == SwitcherKeyboardMonitor.cancellationEventTag {
+                return Unmanaged.passUnretained(event)
+            }
             let swallowed = MainActor.assumeIsolated {
                 let monitor = Unmanaged<PreviewKeyboardMonitor>.fromOpaque(context).takeUnretainedValue()
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {

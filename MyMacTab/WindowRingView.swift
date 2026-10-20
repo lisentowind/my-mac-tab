@@ -807,6 +807,11 @@ private struct WindowActionButtonStyle: ButtonStyle {
 // 默认不夺走目标应用焦点；仅显式点击搜索框时允许原生输入法获得键盘焦点。
 final class DockPreviewPanel: NSPanel {
     var allowsKeyboardFocus = false
+    var onMouseDown: (() -> Void)?
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown || event.type == .rightMouseDown { onMouseDown?() }
+        super.sendEvent(event)
+    }
     override var canBecomeKey: Bool { allowsKeyboardFocus }
     override var canBecomeMain: Bool { false }
 }

@@ -53,6 +53,8 @@ final class WindowManager: NSObject, ObservableObject {
     private var observedFocusPID: pid_t?
     private var isDockSearchComposing = false
     private var dockKeyboardPointer: CGPoint?
+    var claimSwitcherPreview: (() -> Bool)?
+    private var nativeSwitcherDismissalDeadline: TimeInterval = 0
 
     var dockSelectedWindowID: String? {
         selectedApplicationID == dockPreviewApplicationID ? selectedWindow?.id : nil
@@ -102,6 +104,17 @@ final class WindowManager: NSObject, ObservableObject {
     }
 
     func beginDockSearch() {
+        preparePreviewInteraction()
+        let delay = nativeSwitcherDismissalDeadline - ProcessInfo.processInfo.systemUptime
+        if delay > 0 {
+            let applicationID = dockPreviewRequestedApplicationID
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, self.dockPreviewRequestedApplicationID == applicationID,
+                      self.dockPreviewPanel?.isVisible == true else { return }
+                self.beginDockSearch()
+            }
+            return
+        }
         guard let panel = dockPreviewPanel as? DockPreviewPanel else { return }
         isDockSearchEditing = true
         panel.allowsKeyboardFocus = true
@@ -176,6 +189,7 @@ final class WindowManager: NSObject, ObservableObject {
     private var ringDisplayScale: CGFloat = 1
     private var dockPreviewPanel: NSPanel?
     private var dockPreviewAnchor: CGRect?
+    private var dockPreviewSwitcherFrame: CGRect?
     private var dockPreviewPreferredFrame: CGRect?
     private var dockPreviewVisibleFrame: CGRect?
     private var dockPreviewTargetFrame: CGRect?
@@ -394,7 +408,8 @@ final class WindowManager: NSObject, ObservableObject {
     }
 
     func showDockPreview(for applicationID: String, at dockItemFrame: CGRect,
-                         avoiding menuFrames: [CGRect] = [], labels labelFrames: [CGRect] = []) {
+                         avoiding menuFrames: [CGRect] = [], labels labelFrames: [CGRect] = [],
+                         switcherFrame: CGRect? = nil) {
         guard hasAccessibilityPermission, !ringRequested, let pid = pid_t(applicationID),
               let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else {
             dismissDockPreview()
@@ -411,6 +426,7 @@ final class WindowManager: NSObject, ObservableObject {
         dockPreviewLoadTask = nil
         dockPreviewRequestedApplicationID = applicationID
         dockPreviewAnchor = dockItemFrame
+        dockPreviewSwitcherFrame = switcherFrame
         dockPreviewMenuFrames = menuFrames
         dockPreviewLabelFrames = labelFrames
         if dockPreviewApplicationID != applicationID || dockPreviewPanel?.isVisible != true { rebuildApplications() }
@@ -442,8 +458,9 @@ final class WindowManager: NSObject, ObservableObject {
         updateDockPreviewFocusedWindow()
         let panel = dockPreviewPanel ?? makeDockPreviewPanel()
         dockPreviewPanel = panel
+        panel.level = previewPanelLevel
         if panel.contentView == nil { panel.contentView = makeDockPreviewContent() }
-        positionDockPreview(at: anchor)
+        guard positionDockPreview(at: anchor) else { return }
         if !panel.isVisible {
             panel.orderFrontRegardless()
             previewKeyboard.handleKey = { [weak self] code, text, flags in
@@ -454,17 +471,65 @@ final class WindowManager: NSObject, ObservableObject {
         }
     }
 
-    func updateDockPreviewAnchor(_ frame: CGRect) {
-        guard dockPreviewAnchor != frame else { return }
+    func updateDockPreviewAnchor(_ frame: CGRect, switcherFrame: CGRect? = nil) {
+        guard dockPreviewAnchor != frame || dockPreviewSwitcherFrame != switcherFrame else { return }
         dockPreviewAnchor = frame
+        dockPreviewSwitcherFrame = switcherFrame
+        dockPreviewPanel?.level = previewPanelLevel
         if dockPreviewPanel?.isVisible == true { positionDockPreview(at: frame) }
     }
 
-    private func positionDockPreview(at anchor: CGRect) {
-        guard let app = dockPreviewApplication, let panel = dockPreviewPanel else { return }
+    private var previewPanelLevel: NSWindow.Level {
+        dockPreviewSwitcherFrame == nil ? .floating : NSWindow.Level(rawValue: NSWindow.Level.popUpMenu.rawValue + 1)
+    }
+
+    private var previewObstacles: [CGRect] {
+        dockPreviewMenuFrames + dockPreviewLabelFrames + (dockPreviewSwitcherFrame.map { [$0] } ?? [])
+    }
+
+    @discardableResult func takeOverSwitcherPreview(at point: CGPoint) -> Bool {
+        guard let panel = dockPreviewPanel, panel.isVisible,
+              panel.frame.contains(point) || thumbnail.contains(point) else { return false }
+        return preparePreviewInteraction()
+    }
+
+    @discardableResult private func preparePreviewInteraction() -> Bool {
+        guard claimSwitcherPreview?() == true else { return false }
+        nativeSwitcherDismissalDeadline = ProcessInfo.processInfo.systemUptime + 0.06
+        let applicationID = dockPreviewRequestedApplicationID
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+            guard let self, self.dockPreviewRequestedApplicationID == applicationID,
+                  let panel = self.dockPreviewPanel, panel.isVisible,
+                  panel.frame.contains(NSEvent.mouseLocation) else { return }
+            // 退出原生切换后指针可能静止，补送本地移动事件以更新行高亮和长悬停预览。
+            panel.contentView?.updateTrackingAreas()
+            if let event = NSEvent.mouseEvent(with: .mouseMoved,
+                                             location: panel.convertPoint(fromScreen: NSEvent.mouseLocation),
+                                             modifierFlags: NSEvent.modifierFlags,
+                                             timestamp: ProcessInfo.processInfo.systemUptime,
+                                             windowNumber: panel.windowNumber, context: nil,
+                                             eventNumber: 0, clickCount: 0, pressure: 0) {
+                panel.sendEvent(event)
+            }
+        }
+        return true
+    }
+
+    @discardableResult private func positionDockPreview(at anchor: CGRect) -> Bool {
+        guard let app = dockPreviewApplication, let panel = dockPreviewPanel else { return false }
         let screen = NSScreen.screens.first(where: { $0.frame.intersects(anchor) }) ?? screenUnderPointer()
         let visible = screen.visibleFrame
-        let height = min(DockPreviewGeometry.height(windowCount: app.windows.count), visible.height)
+        var height = min(DockPreviewGeometry.height(windowCount: app.windows.count), visible.height)
+        if let switcher = dockPreviewSwitcherFrame {
+            // 空间不足时缩短列表并滚动，不遮盖原生图标。
+            let above = visible.maxY - switcher.maxY - 12
+            let below = switcher.minY - visible.minY - 12
+            height = min(height, max(above, below))
+            guard height >= DockPreviewGeometry.height(windowCount: 1) else {
+                hideDockPreviewPanel()
+                return false
+            }
+        }
         if dockPreviewContentWidth == nil {
             dockPreviewContentWidth = DockPreviewGeometry.width(for: app, availableWidth: visible.width)
         }
@@ -472,7 +537,8 @@ final class WindowManager: NSObject, ObservableObject {
         dockPreviewPreferredFrame = dockPreviewFrame(item: anchor, size: size, screen: screen, visible: visible)
         dockPreviewVisibleFrame = visible
         updateDockPreviewPosition(avoiding: dockPreviewMenuFrames, labels: dockPreviewLabelFrames,
-                                  animated: panel.isVisible)
+                                  animated: panel.isVisible && dockPreviewSwitcherFrame == nil)
+        return true
     }
 
     func dismissDockPreview() {
@@ -481,6 +547,8 @@ final class WindowManager: NSObject, ObservableObject {
         dockPreviewRequestedApplicationID = nil
         hideDockPreviewPanel()
         dockPreviewAnchor = nil
+        dockPreviewSwitcherFrame = nil
+        nativeSwitcherDismissalDeadline = 0
         dockPreviewMenuFrames = []
         dockPreviewLabelFrames = []
     }
@@ -561,7 +629,7 @@ final class WindowManager: NSObject, ObservableObject {
     }
 
     private func applyDockPreviewFrame(_ frame: CGRect, to panel: NSPanel) {
-        thumbnail.updateAnchor(frame, avoiding: dockPreviewMenuFrames + dockPreviewLabelFrames)
+        thumbnail.updateAnchor(frame, avoiding: previewObstacles, level: previewPanelLevel)
         guard panel.frame != frame else { return }
         if panel.frame.size == frame.size {
             panel.setFrameOrigin(frame.origin)
@@ -601,6 +669,7 @@ final class WindowManager: NSObject, ObservableObject {
 
     private func performDockWindowAction(_ id: String, action: DockWindowAction) {
         guard let window = windowsByID[id] else { return }
+        preparePreviewInteraction()
         endDockSearch()
         thumbnail.hide()
         let previousAction = windowActionTask
@@ -610,6 +679,9 @@ final class WindowManager: NSObject, ObservableObject {
             await previousAction?.value
             guard !Task.isCancelled, let self, generation == self.windowActionGeneration,
                   !window.application.isTerminated else { return }
+            let delay = self.nativeSwitcherDismissalDeadline - ProcessInfo.processInfo.systemUptime
+            if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+            guard !Task.isCancelled, generation == self.windowActionGeneration else { return }
             let state = await WindowAccessibilityReader.shared.state(of: record)
             guard !Task.isCancelled, generation == self.windowActionGeneration, !window.application.isTerminated else { return }
             let isFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == window.application.processIdentifier
@@ -983,6 +1055,7 @@ final class WindowManager: NSObject, ObservableObject {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
         panel.contentView = makeDockPreviewContent()
+        panel.onMouseDown = { [weak self] in self?.preparePreviewInteraction() }
         return panel
     }
 
@@ -994,6 +1067,15 @@ final class WindowManager: NSObject, ObservableObject {
     }
 
     private func dockPreviewFrame(item: CGRect, size: CGSize, screen: NSScreen, visible: CGRect) -> CGRect {
+        if let switcher = dockPreviewSwitcherFrame {
+            let above = visible.maxY - switcher.maxY - 12
+            let below = switcher.minY - visible.minY - 12
+            let y = above >= size.height || above >= below
+                ? switcher.maxY + 12 : switcher.minY - size.height - 12
+            return CGRect(x: min(max(item.midX - size.width / 2, visible.minX), visible.maxX - size.width),
+                          y: min(max(y, visible.minY), visible.maxY - size.height),
+                          width: size.width, height: size.height)
+        }
         let screenFrame = screen.frame
         let bottomDistance = abs(item.minY - screenFrame.minY)
         let topDistance = abs(screenFrame.maxY - item.maxY)

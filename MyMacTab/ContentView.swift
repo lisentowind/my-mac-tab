@@ -71,11 +71,15 @@ struct ContentView: View {
 
     private var preview: some View {
         Form {
-            Section("Dock 悬浮列表") {
-                Toggle("悬停 Dock 图标时显示窗口", isOn: $preferences.dockPreviewEnabled)
+            Section("悬浮窗口列表") {
+                Toggle("悬停应用图标时显示窗口", isOn: $preferences.dockPreviewEnabled)
+                Toggle("同时预览 ⌘Tab 中的应用", isOn: $preferences.switcherPreviewEnabled)
+                    .disabled(!preferences.dockPreviewEnabled)
                 delaySlider("显示延迟", value: $preferences.hoverDelay, range: 0...0.8)
                     .disabled(!preferences.dockPreviewEnabled)
                 Text("列表按最近使用排序，显示期间保持位置稳定。点击当前窗口可最小化，再次打开可恢复。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                Text("按住 ⌘ 悬停原生切换器图标；将鼠标移入浮窗后，即可松开 ⌘，点击窗口或长悬停查看缩略图。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Section("窗口缩略图") {
@@ -117,7 +121,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
                 Text("按应用显示预览").font(.system(size: 18, weight: .semibold))
-                Text("关闭后，悬停该应用的 Dock 图标时不显示列表和缩略图；快捷键窗口环仍可使用。")
+                Text("关闭后，悬停该应用的 Dock 或 ⌘Tab 图标时不显示列表和缩略图；快捷键窗口环仍可使用。")
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             List(applicationOptions) { option in

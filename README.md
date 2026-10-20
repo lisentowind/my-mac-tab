@@ -32,6 +32,18 @@
 - 出现原生菜单或名称气泡时自动避让，位置变化使用临界阻尼弹簧动画。
 - 可在设置里按应用单独关闭预览，快捷键圆环不受影响。
 
+### 原生 ⌘Tab 悬停预览
+
+按 `⌘Tab` 呼出系统应用切换器，继续按住 `⌘`，将鼠标移到应用图标上即可查看窗口列表。
+
+- 复用 Dock 的悬停延迟、应用排除、窗口操作与可选缩略图。
+- 列表显示在切换器上方或下方，空间有限时缩短列表并滚动。
+- 鼠标仍在原生图标上时，松开 `⌘` 或按 `Esc` 会收起预览，保留原生应用切换行为。
+- 将鼠标移入预览浮窗即取消原生选择并保留列表；此时可松开 `⌘`，点击窗口、查看缩略图或使用搜索。
+- 可在“设置 → 窗口预览”关闭“同时预览 ⌘Tab 中的应用”。
+
+此入口依赖系统通过辅助功能公开的 `AXProcessSwitcherList` 和图标信息；无法识别时不按图标排列顺序猜测应用。不同 macOS 版本的原生切换器需要本机验证。
+
 ### 窗口缩略图（可选）
 
 长悬停某个窗口条目（默认 450ms）后，在列表旁显示一张该窗口的画面。
@@ -132,6 +144,7 @@ MyMacTab/
     ├── AccessibilityReader.swift   AX 批量读取、聚焦、最小化、关闭、分屏
     ├── WindowRingView.swift        圆环与扇片视图、几何定义
     ├── DockHoverController.swift   Dock 位置扫描与图标命中
+    ├── SwitcherKeyboardMonitor.swift 原生 ⌘Tab 的只读键盘观察与选择取消
     ├── WindowThumbnail.swift       缩略图读取、缓存与展示
     ├── PreviewPreferences.swift    UserDefaults 偏好设置
     ├── PreviewKeyboardMonitor.swift 列表可见期间的键盘事件拦截

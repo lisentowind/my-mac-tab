@@ -17,6 +17,7 @@ final class PreviewPreferences: ObservableObject {
     static let shared = PreviewPreferences()
     private let defaults: UserDefaults
     @Published var dockPreviewEnabled: Bool { didSet { defaults.set(dockPreviewEnabled, forKey: "preview.enabled") } }
+    @Published var switcherPreviewEnabled: Bool { didSet { defaults.set(switcherPreviewEnabled, forKey: "preview.switcher") } }
     @Published var thumbnailsEnabled: Bool { didSet { defaults.set(thumbnailsEnabled, forKey: "preview.thumbnails") } }
     @Published var hoverDelay: Double { didSet { defaults.set(hoverDelay, forKey: "preview.delay") } }
     @Published var thumbnailDelay: Double { didSet { defaults.set(thumbnailDelay, forKey: "preview.thumbnailDelay") } }
@@ -28,6 +29,7 @@ final class PreviewPreferences: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         dockPreviewEnabled = defaults.object(forKey: "preview.enabled") as? Bool ?? true
+        switcherPreviewEnabled = defaults.object(forKey: "preview.switcher") as? Bool ?? true
         thumbnailsEnabled = defaults.object(forKey: "preview.thumbnails") as? Bool ?? false
         hoverDelay = min(0.8, max(0, defaults.object(forKey: "preview.delay") as? Double ?? 0.15))
         thumbnailDelay = min(1.2, max(0.25, defaults.object(forKey: "preview.thumbnailDelay") as? Double ?? 0.45))
