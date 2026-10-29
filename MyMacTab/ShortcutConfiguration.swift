@@ -172,10 +172,13 @@ struct ShortcutBinding: Codable, Equatable {
 final class ShortcutConfiguration: ObservableObject {
     static let shared = ShortcutConfiguration()
     @Published private(set) var bindings: [ShortcutAction: ShortcutBinding]
-    @Published var recordingAction: ShortcutAction?
+    @Published private(set) var recordingAction: ShortcutAction?
     @Published var registrationError: String?
     @Published var assignmentError: String?
     var onGlobalShortcutsChanged: (() -> Void)?
+
+    private var recordingMonitor: Any?
+    private var recordingResignCancellable: AnyCancellable?
 
     private init(defaults: UserDefaults = .standard) {
         if let data = defaults.data(forKey: "shortcuts.bindings"),
@@ -202,8 +205,66 @@ final class ShortcutConfiguration: ObservableObject {
         }
     }
 
+    // 录入由 ShortcutConfiguration 自己持有本地键盘监视器，不依赖某个 NSView 成为 first responder。
+    // 设置窗口里的行视图可能被 SwiftUI 重建或抢走焦点，绑定到 first responder 会让按键永远收不到。
+    func beginRecording(_ action: ShortcutAction) {
+        guard recordingAction != action else { return }
+        stopRecordingMonitor()
+        recordingAction = action
+        assignmentError = nil
+        // 录入期间先注销 Carbon 全局快捷键，避免按下候选组合时先触发旧动作。
+        onGlobalShortcutsChanged?()
+
+        // 切到其他应用时结束录入，避免全局快捷键一直处于注销状态。
+        recordingResignCancellable = NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+            .sink { [weak self] _ in self?.cancelRecording() }
+
+        recordingMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] event in
+            guard let self, self.recordingAction == action else { return event }
+            switch event.type {
+            case .keyDown:
+                self.capture(ShortcutBinding(keyCode: event.keyCode, modifiers: event.modifierFlags), for: action)
+                return nil
+            case .leftMouseDown:
+                // 点击设置页的其他位置视为取消；点击另一个录入框时，随后的按钮动作会重新开始录入。
+                self.cancelRecording()
+                return event
+            default:
+                return event
+            }
+        }
+    }
+
+    func cancelRecording() {
+        guard recordingAction != nil || recordingMonitor != nil else { return }
+        stopRecordingMonitor()
+        recordingAction = nil
+        onGlobalShortcutsChanged?()
+    }
+
+    private func capture(_ binding: ShortcutBinding, for action: ShortcutAction) {
+        guard !action.requiresModifier || !binding.modifiers.isEmpty else {
+            assignmentError = "全局快捷键需要至少一个修饰键，请重新按下组合键。"
+            return
+        }
+        stopRecordingMonitor()
+        recordingAction = nil
+        _ = assign(binding, to: action)
+        // 即使因为冲突保留旧组合，也要恢复 Carbon 全局注册。
+        onGlobalShortcutsChanged?()
+    }
+
+    private func stopRecordingMonitor() {
+        if let recordingMonitor { NSEvent.removeMonitor(recordingMonitor) }
+        recordingMonitor = nil
+        recordingResignCancellable = nil
+    }
+
     @discardableResult func assign(_ binding: ShortcutBinding, to action: ShortcutAction) -> ShortcutAction? {
-        guard !action.requiresModifier || !binding.modifiers.isEmpty else { return action }
+        guard !action.requiresModifier || !binding.modifiers.isEmpty else {
+            assignmentError = "全局快捷键需要至少一个修饰键。"
+            return action
+        }
         if let conflict = ShortcutAction.allCases.first(where: {
             $0 != action && ($0.group == action.group || $0 == .showRing || action == .showRing)
                 && self.binding(for: $0) == binding
@@ -259,7 +320,7 @@ struct ShortcutSettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .onDisappear { configuration.recordingAction = nil; configuration.onGlobalShortcutsChanged?() }
+        .onDisappear { configuration.cancelRecording() }
     }
 
     private func shortcutRow(_ action: ShortcutAction) -> some View {
@@ -278,117 +339,35 @@ struct ShortcutSettingsView: View {
 private struct ShortcutRecorder: View {
     let action: ShortcutAction
     @ObservedObject private var configuration = ShortcutConfiguration.shared
-    @State private var isRecording = false
-    @State private var invalidGlobalBinding = false
+
+    private var isRecording: Bool { configuration.recordingAction == action }
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(configuration.recordingAction == action ? "按下快捷键…" : configuration.binding(for: action).displayName)
-                .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .frame(minWidth: 82, minHeight: 24)
-                .overlay {
-                    ShortcutCaptureView(isRecording: $isRecording, action: action) { binding in
-                        if action.requiresModifier && binding.modifiers.isEmpty {
-                            invalidGlobalBinding = true
-                            return
-                        }
-                        invalidGlobalBinding = false
-                        _ = configuration.assign(binding, to: action)
-                    }
-                }
-                .background(configuration.recordingAction == action ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.045),
-                            in: RoundedRectangle(cornerRadius: 6))
-                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(configuration.recordingAction == action ? Color.accentColor : Color.clear))
-                .contentShape(Rectangle())
-            if invalidGlobalBinding {
-                Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
-                    .help("全局快捷键至少需要一个修饰键")
+            Button {
+                configuration.beginRecording(action)
+            } label: {
+                Text(isRecording ? "按下快捷键…" : configuration.binding(for: action).displayName)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .padding(.horizontal, 8)
+                    .frame(minWidth: 82, minHeight: 24)
+                    .background(isRecording ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.045),
+                                in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(isRecording ? Color.accentColor : Color.clear))
+                    .contentShape(RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(action.title)快捷键")
+            .accessibilityValue(isRecording ? "正在录入" : configuration.binding(for: action).displayName)
+            .accessibilityHint("点击后按下新的快捷键组合")
+            .help("点击后按下新的快捷键组合")
+
+            if isRecording, let error = configuration.assignmentError {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.orange)
+                    .help(error)
             }
         }
-        .help("点击后按下新的快捷键组合")
-    }
-}
-
-private struct ShortcutCaptureView: NSViewRepresentable {
-    @Binding var isRecording: Bool
-    let action: ShortcutAction
-    let onCapture: (ShortcutBinding) -> Void
-
-    func makeNSView(context: Context) -> ShortcutCaptureNSView {
-        let view = ShortcutCaptureNSView()
-        view.beginRecording = {
-            ShortcutConfiguration.shared.recordingAction = action
-            ShortcutConfiguration.shared.onGlobalShortcutsChanged?()
-            isRecording = true
-        }
-        view.finishRecording = { binding in
-            onCapture(binding)
-            isRecording = false
-            ShortcutConfiguration.shared.recordingAction = nil
-            ShortcutConfiguration.shared.onGlobalShortcutsChanged?()
-        }
-        return view
-    }
-
-    func updateNSView(_ view: ShortcutCaptureNSView, context: Context) {
-        view.beginRecording = {
-            ShortcutConfiguration.shared.recordingAction = action
-            ShortcutConfiguration.shared.onGlobalShortcutsChanged?()
-            isRecording = true
-        }
-        view.finishRecording = { binding in
-            onCapture(binding)
-            isRecording = false
-            ShortcutConfiguration.shared.recordingAction = nil
-            ShortcutConfiguration.shared.onGlobalShortcutsChanged?()
-        }
-    }
-}
-
-private final class ShortcutCaptureNSView: NSView {
-    private var recordingMonitor: Any?
-    var beginRecording: (() -> Void)?
-    var finishRecording: ((ShortcutBinding) -> Void)?
-
-    override var acceptsFirstResponder: Bool { true }
-
-    override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        beginRecording?()
-        if let recordingMonitor { NSEvent.removeMonitor(recordingMonitor) }
-        recordingMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.window?.firstResponder === self,
-                  ShortcutConfiguration.shared.recordingAction != nil else { return event }
-            self.keyDown(with: event)
-            return nil
-        }
-    }
-
-    override func keyDown(with event: NSEvent) {
-        guard ShortcutConfiguration.shared.recordingAction != nil else { super.keyDown(with: event); return }
-        finishRecording?(ShortcutBinding(keyCode: event.keyCode, modifiers: event.modifierFlags))
-        window?.makeFirstResponder(nil)
-    }
-
-    override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard window?.firstResponder === self, ShortcutConfiguration.shared.recordingAction != nil else { return false }
-        keyDown(with: event)
-        return true
-    }
-
-    override func resignFirstResponder() -> Bool {
-        if let recordingMonitor { NSEvent.removeMonitor(recordingMonitor) }
-        recordingMonitor = nil
-        ShortcutConfiguration.shared.recordingAction = nil
-        ShortcutConfiguration.shared.onGlobalShortcutsChanged?()
-        return super.resignFirstResponder()
-    }
-
-    override func viewWillMove(toWindow newWindow: NSWindow?) {
-        if newWindow == nil, let recordingMonitor {
-            NSEvent.removeMonitor(recordingMonitor)
-            self.recordingMonitor = nil
-        }
-        super.viewWillMove(toWindow: newWindow)
     }
 }
